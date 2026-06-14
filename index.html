@@ -5,13 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>五子棋 Online · Gomoku</title>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700&family=Cinzel:wght@400;700&display=swap" rel="stylesheet">
-
-<!-- ╔══════════════════════════════════════════════╗ -->
-<!-- ║   請將下方 firebaseConfig 換成你自己的設定值    ║ -->
-<!-- ╚══════════════════════════════════════════════╝ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getDatabase, ref, set, get, update, onValue, push, serverTimestamp, remove }
+import { getDatabase, ref, set, get, update, onValue, push, serverTimestamp }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 
 const firebaseConfig = {
@@ -27,333 +23,490 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db  = getDatabase(app);
 
-/* ─── constants ─── */
-const SIZE = 15, PADDING = 30, CANVAS_SIZE = 540;
-const STEP = (CANVAS_SIZE - PADDING * 2) / (SIZE - 1);
-const COLS = 'ABCDEFGHJKLMNOP';
+/* ─── dynamic board config (set when room created/joined) ─── */
+let BSIZE    = 15;
+let PADDING  = 30;
+const CSIZE  = 540;
+let STEP     = (CSIZE - PADDING*2) / (BSIZE-1);
+const COLS   = 'ABCDEFGHJKLMNOPQRST';
+
+/* ─── room settings ─── */
+let roomSettings = {
+  boardSize:   15,
+  winCount:    3,      // best-of
+  timeLimit:   0,      // 0=無限制, else seconds per move
+  forbiddenBlack: false,
+  firstPlayer: 'black'
+};
 
 /* ─── state ─── */
-let myColor   = null;   // 'black' | 'white'
+let myColor   = null;
 let roomId    = null;
 let nickname  = '';
 let gameOver  = false;
-let localBoard = Array(SIZE).fill(null).map(()=>Array(SIZE).fill(0));
+let localBoard = [];
 let lastMove  = null;
 let winLine   = [];
 let moveCount = 0;
-let roomRef, boardRef, chatRef, statusRef;
-let unsubBoard, unsubChat, unsubStatus;
+let scores    = { black: 0, white: 0 };
+let roomRef, chatRef;
+let timerInterval = null;
+let timeLeft  = 0;
 
-/* ─── canvas ─── */
 const canvas = document.getElementById('board');
 const ctx    = canvas.getContext('2d');
 
-/* ──────────────────────────────────────────────── */
-/*  LOBBY LOGIC                                      */
-/* ──────────────────────────────────────────────── */
+/* ══════════════════════════════════════
+   LOBBY
+══════════════════════════════════════ */
 window.createRoom = async function() {
   const nick = document.getElementById('nick-input').value.trim();
-  if (!nick) { showLobbyMsg('請輸入暱稱', true); return; }
+  if (!nick) { lobbyMsg('請輸入暱稱', true); return; }
   nickname = nick;
-  const id  = Math.random().toString(36).slice(2,8).toUpperCase();
-  const rRef = ref(db, `rooms/${id}`);
-  await set(rRef, {
-    black: { name: nick, connected: true },
-    white: null,
-    board: Array(SIZE*SIZE).fill(0),
-    currentTurn: 'black',
+
+  // Read settings from form
+  roomSettings.boardSize      = parseInt(document.getElementById('opt-size').value);
+  roomSettings.winCount       = parseInt(document.getElementById('opt-wins').value);
+  roomSettings.timeLimit      = parseInt(document.getElementById('opt-time').value);
+  roomSettings.forbiddenBlack = document.getElementById('opt-forbidden').checked;
+  roomSettings.firstPlayer    = document.getElementById('opt-first').value;
+
+  const id = Math.random().toString(36).slice(2,8).toUpperCase();
+  await set(ref(db, `rooms/${id}`), {
+    settings: roomSettings,
+    black: { name: roomSettings.firstPlayer==='black' ? nick : '等待中', connected: roomSettings.firstPlayer==='black' },
+    white: { name: roomSettings.firstPlayer==='white' ? nick : '等待中', connected: roomSettings.firstPlayer==='white' },
+    board: Array(roomSettings.boardSize * roomSettings.boardSize).fill(0),
+    currentTurn: roomSettings.firstPlayer,
     status: 'waiting',
     createdAt: serverTimestamp(),
-    moveCount: 0
+    moveCount: 0,
+    scores: { black: 0, white: 0 },
+    timerStart: null
   });
-  roomId   = id;
-  myColor  = 'black';
+
+  roomId  = id;
+  myColor = roomSettings.firstPlayer;
   joinRoom(id);
-  showLobbyMsg(`房間已建立！房間號：${id}`, false);
   document.getElementById('room-code-display').textContent = id;
   document.getElementById('invite-line').style.display = 'flex';
   document.getElementById('waiting-msg').style.display  = 'block';
+  lobbyMsg(`房間 ${id} 已建立！等待對手…`);
 };
 
 window.joinRoomById = async function() {
   const nick = document.getElementById('nick-input').value.trim();
   const id   = document.getElementById('room-input').value.trim().toUpperCase();
-  if (!nick) { showLobbyMsg('請輸入暱稱', true); return; }
-  if (!id)   { showLobbyMsg('請輸入房間號', true); return; }
+  if (!nick) { lobbyMsg('請輸入暱稱', true); return; }
+  if (!id)   { lobbyMsg('請輸入房間號', true); return; }
   nickname = nick;
-  const rRef = ref(db, `rooms/${id}`);
-  const snap = await get(rRef);
-  if (!snap.exists()) { showLobbyMsg('房間不存在', true); return; }
-  const data = snap.val();
-  if (data.white) { showLobbyMsg('房間已滿', true); return; }
-  await update(rRef, { 'white': { name: nick, connected: true }, status: 'playing' });
-  roomId   = id;
-  myColor  = 'white';
+
+  const snap = await get(ref(db, `rooms/${id}`));
+  if (!snap.exists()) { lobbyMsg('房間不存在', true); return; }
+  const d = snap.val();
+  if (d.status !== 'waiting') { lobbyMsg('房間已開始或已滿', true); return; }
+
+  const s = d.settings || {};
+  // The joiner takes the opposite color
+  const joinColor = s.firstPlayer === 'black' ? 'white' : 'black';
+  const upd = { status: 'playing' };
+  upd[joinColor] = { name: nick, connected: true };
+  await update(ref(db, `rooms/${id}`), upd);
+
+  roomId  = id;
+  myColor = joinColor;
   joinRoom(id);
 };
 
 window.copyRoomCode = function() {
-  const code = document.getElementById('room-code-display').textContent;
-  navigator.clipboard.writeText(code).then(()=>showLobbyMsg('已複製房間號！'));
+  navigator.clipboard.writeText(document.getElementById('room-code-display').textContent)
+    .then(() => lobbyMsg('已複製！'));
 };
 
-function showLobbyMsg(msg, isErr=false) {
+function lobbyMsg(msg, err=false) {
   const el = document.getElementById('lobby-msg');
   el.textContent = msg;
-  el.style.color = isErr ? '#e74c3c' : '#27ae60';
+  el.style.color = err ? '#e74c3c' : '#27ae60';
 }
 
+/* ══════════════════════════════════════
+   JOIN & SYNC
+══════════════════════════════════════ */
 function joinRoom(id) {
-  roomRef   = ref(db, `rooms/${id}`);
-  boardRef  = ref(db, `rooms/${id}/board`);
-  chatRef   = ref(db, `rooms/${id}/chat`);
-  statusRef = ref(db, `rooms/${id}/status`);
+  roomRef = ref(db, `rooms/${id}`);
+  chatRef = ref(db, `rooms/${id}/chat`);
 
-  // Watch full room state
-  unsubBoard = onValue(roomRef, snap => {
+  onValue(roomRef, snap => {
     if (!snap.exists()) return;
     const d = snap.val();
-
-    // Show game once both joined
     if (d.status === 'playing' || d.status === 'over') {
-      document.getElementById('lobby').style.display   = 'none';
-      document.getElementById('game').style.display    = 'flex';
-      syncFromFirebase(d);
-    }
-    if (d.status === 'waiting') {
-      document.getElementById('waiting-msg').style.display = 'block';
+      document.getElementById('lobby').style.display = 'none';
+      document.getElementById('game').style.display  = 'flex';
+      syncState(d);
     }
   });
 
-  // Watch chat
-  unsubChat = onValue(chatRef, snap => {
-    renderChat(snap.val());
-  });
+  onValue(chatRef, snap => renderChat(snap.val()));
 }
 
-function syncFromFirebase(d) {
-  // Rebuild board
-  const flat = d.board || Array(SIZE*SIZE).fill(0);
-  for (let r=0;r<SIZE;r++)
-    for (let c=0;c<SIZE;c++)
-      localBoard[r][c] = flat[r*SIZE+c];
+function syncState(d) {
+  const s = d.settings || {};
+  BSIZE   = s.boardSize || 15;
+  STEP    = (CSIZE - PADDING*2) / (BSIZE-1);
+  roomSettings = s;
+
+  // Rebuild local board
+  localBoard = [];
+  const flat = d.board || Array(BSIZE*BSIZE).fill(0);
+  for (let r=0;r<BSIZE;r++) {
+    localBoard.push([]);
+    for (let c=0;c<BSIZE;c++) localBoard[r].push(flat[r*BSIZE+c]);
+  }
 
   moveCount = d.moveCount || 0;
   lastMove  = d.lastMove  || null;
   winLine   = d.winLine   || [];
   gameOver  = d.status === 'over';
+  scores    = d.scores    || { black:0, white:0 };
+
+  // Resize canvas for board size
+  canvas.width = canvas.height = CSIZE;
 
   updateUI(d);
   render();
+  updateRulesDisplay(s);
 
-  if (gameOver && winLine.length) {
-    setTimeout(()=>showWinOverlay(d.winner, d.winnerName), 400);
+  if (gameOver && winLine.length) setTimeout(() => showWin(d), 400);
+
+  // Timer
+  clearInterval(timerInterval);
+  if (!gameOver && s.timeLimit > 0 && d.timerStart) {
+    const elapsed = (Date.now() - d.timerStart) / 1000;
+    timeLeft = Math.max(0, s.timeLimit - elapsed);
+    startTimerDisplay(d.currentTurn);
+  } else if (!gameOver && s.timeLimit > 0) {
+    timeLeft = s.timeLimit;
+    updateTimerUI(timeLeft, d.currentTurn);
   }
 }
 
-/* ──────────────────────────────────────────────── */
-/*  GAME LOGIC                                       */
-/* ──────────────────────────────────────────────── */
+/* ══════════════════════════════════════
+   GAME LOGIC
+══════════════════════════════════════ */
 canvas.addEventListener('click', async e => {
   if (gameOver) return;
   const rect = canvas.getBoundingClientRect();
-  const sx = CANVAS_SIZE / rect.width, sy = CANVAS_SIZE / rect.height;
-  const x  = (e.clientX - rect.left) * sx;
-  const y  = (e.clientY - rect.top)  * sy;
-  const col = Math.round((x - PADDING) / STEP);
-  const row = Math.round((y - PADDING) / STEP);
-  if (col<0||col>=SIZE||row<0||row>=SIZE) return;
+  const sx = CSIZE/rect.width, sy = CSIZE/rect.height;
+  const x = (e.clientX-rect.left)*sx, y = (e.clientY-rect.top)*sy;
+  const col = Math.round((x-PADDING)/STEP), row = Math.round((y-PADDING)/STEP);
+  if (col<0||col>=BSIZE||row<0||row>=BSIZE) return;
 
-  // Fetch current turn from server
   const snap = await get(roomRef);
   const d = snap.val();
   if (!d || d.status !== 'playing') return;
   if (d.currentTurn !== myColor) return;
-  if (d.board[row*SIZE+col] !== 0) return;
+  if (d.board[row*BSIZE+col] !== 0) return;
 
   const player = myColor === 'black' ? 1 : 2;
-  const newFlat = [...d.board];
-  newFlat[row*SIZE+col] = player;
 
-  const line = checkWin5(newFlat, row, col, player);
+  // Forbidden move check (black only, 三三/四四)
+  if (d.settings?.forbiddenBlack && myColor === 'black') {
+    const reason = checkForbidden(d.board, row, col, player);
+    if (reason) { showForbiddenFlash(reason); return; }
+  }
+
+  const newFlat = [...d.board];
+  newFlat[row*BSIZE+col] = player;
+  const line = checkWin(newFlat, row, col, player, BSIZE);
   const nextTurn = myColor === 'black' ? 'white' : 'black';
   const newCount = (d.moveCount||0) + 1;
+  const newScores = { ...d.scores };
 
-  const updates = {
+  const upd = {
     board: newFlat,
     currentTurn: line ? d.currentTurn : nextTurn,
     lastMove: { col, row, player },
     moveCount: newCount,
-    status: line ? 'over' : 'playing',
+    timerStart: serverTimestamp()
   };
+
   if (line) {
-    updates.winner     = myColor;
-    updates.winnerName = nickname;
-    updates.winLine    = line;
+    newScores[myColor] = (newScores[myColor]||0) + 1;
+    const targetWins = Math.ceil((d.settings?.winCount||1));
+    const isMatchOver = newScores[myColor] >= targetWins;
+    upd.winLine   = line;
+    upd.winner    = myColor;
+    upd.winnerName= nickname;
+    upd.scores    = newScores;
+    upd.status    = 'over';
+    upd.matchOver = isMatchOver;
   }
-  await update(roomRef, updates);
+
+  await update(roomRef, upd);
 });
 
-// Ghost on hover
 canvas.addEventListener('mousemove', e => {
   if (gameOver) return;
   const rect = canvas.getBoundingClientRect();
-  const sx = CANVAS_SIZE/rect.width, sy = CANVAS_SIZE/rect.height;
-  const x = (e.clientX-rect.left)*sx, y = (e.clientY-rect.top)*sy;
-  const col = Math.round((x-PADDING)/STEP), row = Math.round((y-PADDING)/STEP);
+  const sx = CSIZE/rect.width, sy = CSIZE/rect.height;
+  const col = Math.round(((e.clientX-rect.left)*sx-PADDING)/STEP);
+  const row = Math.round(((e.clientY-rect.top)*sy-PADDING)/STEP);
   render();
-  if (col>=0&&col<SIZE&&row>=0&&row<SIZE&&localBoard[row][col]===0)
+  if (col>=0&&col<BSIZE&&row>=0&&row<BSIZE&&localBoard[row][col]===0)
     drawStone(col, row, myColor==='black'?1:2, true);
 });
 canvas.addEventListener('mouseleave', render);
 
-function checkWin5(flat, r, c, p) {
+function checkWin(flat, r, c, p, size) {
   const dirs = [[0,1],[1,0],[1,1],[1,-1]];
   for (const [dr,dc] of dirs) {
     let cells = [[r,c]];
-    for (let d=1;d<=4;d++){const nr=r+dr*d,nc=c+dc*d;if(nr>=0&&nr<SIZE&&nc>=0&&nc<SIZE&&flat[nr*SIZE+nc]===p)cells.push([nr,nc]);else break;}
-    for (let d=1;d<=4;d++){const nr=r-dr*d,nc=c-dc*d;if(nr>=0&&nr<SIZE&&nc>=0&&nc<SIZE&&flat[nr*SIZE+nc]===p)cells.push([nr,nc]);else break;}
+    for (let d=1;d<=4;d++){const nr=r+dr*d,nc=c+dc*d;if(nr>=0&&nr<size&&nc>=0&&nc<size&&flat[nr*size+nc]===p)cells.push([nr,nc]);else break;}
+    for (let d=1;d<=4;d++){const nr=r-dr*d,nc=c-dc*d;if(nr>=0&&nr<size&&nc>=0&&nc<size&&flat[nr*size+nc]===p)cells.push([nr,nc]);else break;}
     if (cells.length>=5){cells.sort((a,b)=>a[0]!==b[0]?a[0]-b[0]:a[1]-b[1]);return cells;}
   }
   return null;
 }
 
+// Simplified forbidden: detect open-three or open-four double (三三 / 四四)
+function checkForbidden(flat, r, c, p) {
+  const size = BSIZE;
+  const tmp = [...flat]; tmp[r*size+c] = p;
+  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+  let openFours=0, openThrees=0;
+  for (const [dr,dc] of dirs) {
+    const {count,openEnds} = countLine(tmp, r, c, p, dr, dc, size);
+    if (count === 4 && openEnds >= 1) openFours++;
+    if (count === 3 && openEnds === 2) openThrees++;
+  }
+  if (openFours >= 2) return '四四禁手';
+  if (openThrees >= 2) return '三三禁手';
+  return null;
+}
+
+function countLine(flat, r, c, p, dr, dc, size) {
+  let count=1, openEnds=0;
+  for (let d=1;d<=4;d++){const nr=r+dr*d,nc=c+dc*d;if(nr<0||nr>=size||nc<0||nc>=size)break;if(flat[nr*size+nc]===p)count++;else{if(flat[nr*size+nc]===0)openEnds++;break;}}
+  for (let d=1;d<=4;d++){const nr=r-dr*d,nc=c-dc*d;if(nr<0||nr>=size||nc<0||nc>=size)break;if(flat[nr*size+nc]===p)count++;else{if(flat[nr*size+nc]===0)openEnds++;break;}}
+  return {count, openEnds};
+}
+
+function showForbiddenFlash(reason) {
+  const el = document.getElementById('forbidden-flash');
+  el.textContent = `禁手：${reason}`;
+  el.style.opacity = '1';
+  setTimeout(() => el.style.opacity='0', 1800);
+}
+
+/* ══════════════════════════════════════
+   TIMER
+══════════════════════════════════════ */
+function startTimerDisplay(currentTurn) {
+  clearInterval(timerInterval);
+  if (!roomSettings.timeLimit) return;
+  timerInterval = setInterval(async () => {
+    timeLeft -= 1;
+    updateTimerUI(timeLeft, currentTurn);
+    if (timeLeft <= 0) {
+      clearInterval(timerInterval);
+      // Only the current turn's player triggers timeout
+      if (currentTurn === myColor) {
+        const snap = await get(roomRef);
+        const d = snap.val();
+        if (d && d.status === 'playing' && d.currentTurn === myColor) {
+          const loser = myColor, winner = myColor==='black'?'white':'black';
+          const newScores = { ...d.scores };
+          newScores[winner] = (newScores[winner]||0) + 1;
+          const targetWins = Math.ceil(d.settings?.winCount||1);
+          await update(roomRef, {
+            status: 'over', winner, winnerName: d[winner]?.name || winner,
+            winLine: [], scores: newScores,
+            matchOver: newScores[winner] >= targetWins,
+            timeoutLoser: loser
+          });
+        }
+      }
+    }
+  }, 1000);
+}
+
+function updateTimerUI(t, currentTurn) {
+  const el = document.getElementById('timer-display');
+  if (!roomSettings.timeLimit || !el) return;
+  el.style.display = 'block';
+  const isMyTurn = currentTurn === myColor;
+  el.textContent = `${isMyTurn?'你的時間':'對手時間'}：${Math.max(0,Math.ceil(t))}s`;
+  el.style.color = t <= 10 ? '#e74c3c' : 'var(--gold)';
+}
+
+/* ══════════════════════════════════════
+   RESET / LEAVE
+══════════════════════════════════════ */
 window.resetGame = async function() {
+  clearInterval(timerInterval);
   document.getElementById('win-overlay').classList.remove('visible');
-  gameOver = false;
-  winLine  = [];
+  gameOver = false; winLine = [];
+  const snap = await get(roomRef);
+  const d = snap.val();
+  if (!d) return;
+  // Swap first player each round
+  const nextFirst = d.settings?.firstPlayer === 'black' ? 'white' : 'black';
+  const newSettings = { ...d.settings, firstPlayer: nextFirst };
   await update(roomRef, {
-    board: Array(SIZE*SIZE).fill(0),
-    currentTurn: 'black',
+    board: Array(BSIZE*BSIZE).fill(0),
+    currentTurn: nextFirst,
     status: 'playing',
     lastMove: null,
     moveCount: 0,
-    winner: null,
-    winnerName: null,
-    winLine: null
+    winner: null, winnerName: null, winLine: null,
+    matchOver: false, timeoutLoser: null,
+    timerStart: serverTimestamp(),
+    settings: newSettings
   });
 };
 
-window.leaveRoom = function() {
-  if (unsubBoard) unsubBoard();
-  if (unsubChat)  unsubChat();
-  location.reload();
-};
+window.leaveRoom = function() { location.reload(); };
 
-/* ──────────────────────────────────────────────── */
-/*  CHAT                                             */
-/* ──────────────────────────────────────────────── */
+/* ══════════════════════════════════════
+   CHAT
+══════════════════════════════════════ */
 window.sendChat = async function() {
   const inp = document.getElementById('chat-input');
-  const msg = inp.value.trim();
-  if (!msg || !chatRef) return;
+  const msg = inp.value.trim(); if (!msg||!chatRef) return;
   inp.value = '';
-  await push(chatRef, {
-    name:  nickname,
-    color: myColor,
-    text:  msg,
-    ts:    serverTimestamp()
-  });
+  await push(chatRef, { name: nickname, color: myColor, text: msg, ts: serverTimestamp() });
 };
-
 document.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && document.activeElement === document.getElementById('chat-input'))
-    window.sendChat();
+  if (e.key==='Enter' && document.activeElement===document.getElementById('chat-input')) window.sendChat();
 });
-
 function renderChat(data) {
   const box = document.getElementById('chat-messages');
-  if (!data) { box.innerHTML = '<div class="chat-empty">說點什麼吧…</div>'; return; }
+  if (!data) { box.innerHTML='<div class="chat-empty">說點什麼吧…</div>'; return; }
   const msgs = Object.values(data).sort((a,b)=>(a.ts||0)-(b.ts||0));
-  box.innerHTML = msgs.map(m => {
-    const isMine = m.name === nickname;
-    const stone  = m.color === 'black' ? '●' : '○';
-    return `<div class="chat-msg ${isMine?'mine':''}">
-      <span class="chat-who">${stone} ${escHtml(m.name)}</span>
-      <span class="chat-text">${escHtml(m.text)}</span>
-    </div>`;
-  }).join('');
+  box.innerHTML = msgs.map(m=>`<div class="chat-msg ${m.name===nickname?'mine':''}"><span class="chat-who">${m.color==='black'?'●':'○'} ${esc(m.name)}</span><span class="chat-text">${esc(m.text)}</span></div>`).join('');
   box.scrollTop = box.scrollHeight;
 }
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-/* ──────────────────────────────────────────────── */
-/*  UI helpers                                       */
-/* ──────────────────────────────────────────────── */
+/* ══════════════════════════════════════
+   UI
+══════════════════════════════════════ */
 function updateUI(d) {
+  const s = d.settings || {};
   const isMyTurn = d.currentTurn === myColor;
-  document.getElementById('turn-display').textContent =
-    d.status === 'over'    ? '對局結束' :
-    isMyTurn               ? '輪到你落子' :
-    d.currentTurn==='black'? '黑方落子中…' : '白方落子中…';
-
-  document.getElementById('card-black').classList.toggle('active', d.currentTurn==='black' && !gameOver);
-  document.getElementById('card-white').classList.toggle('active', d.currentTurn==='white' && !gameOver);
-  document.getElementById('stat-moves').textContent = d.moveCount || 0;
-
-  // Labels
   const bname = d.black?.name || '黑方';
-  const wname = d.white?.name || '等待加入…';
+  const wname = d.white?.name || '白方';
+
   document.getElementById('name-black').textContent = bname;
   document.getElementById('name-white').textContent = wname;
-  document.getElementById('my-color-badge').textContent = myColor === 'black' ? `你是黑方 ${bname}` : `你是白方 ${wname}`;
+  document.getElementById('my-color-badge').textContent =
+    myColor==='black' ? `你是 ● 黑方` : `你是 ○ 白方`;
+  document.getElementById('card-black').classList.toggle('active', d.currentTurn==='black'&&!gameOver);
+  document.getElementById('card-white').classList.toggle('active', d.currentTurn==='white'&&!gameOver);
+
+  document.getElementById('turn-display').textContent =
+    d.status==='over'   ? '對局結束' :
+    isMyTurn            ? '輪到你落子 ✦' :
+    d.currentTurn==='black' ? `${bname} 落子中…` : `${wname} 落子中…`;
+
+  document.getElementById('stat-moves').textContent  = d.moveCount || 0;
+  document.getElementById('stat-room').textContent   = roomId || '—';
+  document.getElementById('score-black').textContent = d.scores?.black || 0;
+  document.getElementById('score-white').textContent = d.scores?.white || 0;
+  document.getElementById('score-target').textContent = `目標 ${Math.ceil(s.winCount||1)} 勝`;
+
+  // Timer
+  if (s.timeLimit > 0 && !gameOver) {
+    timeLeft = s.timeLimit;
+    startTimerDisplay(d.currentTurn);
+  } else {
+    clearInterval(timerInterval);
+    const el = document.getElementById('timer-display');
+    if (el) el.style.display = 'none';
+  }
 }
 
-function showWinOverlay(winner, name) {
-  document.getElementById('win-emoji').textContent  = winner === myColor ? '🥇' : '😢';
-  document.getElementById('win-title').textContent  = `${name} 勝利！`;
-  document.getElementById('win-sub').textContent    = `共 ${moveCount} 手`;
+function updateRulesDisplay(s) {
+  document.getElementById('rules-display').innerHTML =
+    `• ${s.boardSize}×${s.boardSize} 棋盤<br>
+     • ${s.firstPlayer==='black'?'黑':'白'}方先行<br>
+     • 五子連線獲勝<br>
+     • ${Math.ceil(s.winCount||1)} 勝制<br>
+     • 禁手：${s.forbiddenBlack?'黑方三三/四四':'無'}<br>
+     • 限時：${s.timeLimit?s.timeLimit+'秒/步':'無限制'}`;
+}
+
+function showWin(d) {
+  const isMe = d.winner === myColor;
+  const isTimeout = !!d.timeoutLoser;
+  document.getElementById('win-emoji').textContent  = isMe ? '🥇' : '😢';
+  document.getElementById('win-title').textContent  = `${d.winnerName} 勝利！`;
+  const reason = isTimeout ? '（對手超時）' : `共 ${moveCount} 手`;
+  const matchMsg = d.matchOver ? `\n🏆 比賽結束！` : '';
+  document.getElementById('win-sub').textContent = reason + matchMsg;
+
+  const resetBtn = document.getElementById('win-reset-btn');
+  const sc = d.scores || {};
+  const target = Math.ceil(d.settings?.winCount||1);
+  if (d.matchOver) {
+    resetBtn.textContent = '新的比賽';
+    resetBtn.onclick = async () => {
+      await update(roomRef, { 'scores/black':0, 'scores/white':0 });
+      window.resetGame();
+    };
+  } else {
+    resetBtn.textContent = `再來一局（${sc.black||0}:${sc.white||0}）`;
+    resetBtn.onclick = window.resetGame;
+  }
+
   document.getElementById('win-overlay').classList.add('visible');
 }
 
-/* ──────────────────────────────────────────────── */
-/*  CANVAS DRAWING                                   */
-/* ──────────────────────────────────────────────── */
+/* ══════════════════════════════════════
+   CANVAS
+══════════════════════════════════════ */
 function render() {
-  ctx.clearRect(0,0,CANVAS_SIZE,CANVAS_SIZE);
+  ctx.clearRect(0,0,CSIZE,CSIZE);
   drawBoard();
-  for (let r=0;r<SIZE;r++)
-    for (let c=0;c<SIZE;c++)
-      if (localBoard[r][c]) drawStone(c,r,localBoard[r][c]);
+  for (let r=0;r<BSIZE;r++)
+    for (let c=0;c<BSIZE;c++)
+      if (localBoard[r]&&localBoard[r][c]) drawStone(c,r,localBoard[r][c]);
   if (lastMove) drawLastMark(lastMove.col, lastMove.row, lastMove.player);
   if (winLine?.length) drawWinLine(winLine);
 }
 
-function getXY(c,r){return[PADDING+c*STEP, PADDING+r*STEP];}
+function xy(c,r){return[PADDING+c*STEP, PADDING+r*STEP];}
 
 function drawBoard(){
-  const g=ctx.createLinearGradient(0,0,CANVAS_SIZE,CANVAS_SIZE);
+  const g=ctx.createLinearGradient(0,0,CSIZE,CSIZE);
   g.addColorStop(0,'#d4aa62');g.addColorStop(.4,'#c8a050');g.addColorStop(1,'#b88c3a');
-  ctx.fillStyle=g; ctx.fillRect(0,0,CANVAS_SIZE,CANVAS_SIZE);
+  ctx.fillStyle=g;ctx.fillRect(0,0,CSIZE,CSIZE);
   ctx.strokeStyle='rgba(140,90,20,0.06)';ctx.lineWidth=.5;
-  for(let i=0;i<CANVAS_SIZE;i+=8){ctx.beginPath();ctx.moveTo(0,i+Math.sin(i*.1)*3);ctx.lineTo(CANVAS_SIZE,i+Math.sin(i*.1)*3);ctx.stroke();}
+  for(let i=0;i<CSIZE;i+=8){ctx.beginPath();ctx.moveTo(0,i);ctx.lineTo(CSIZE,i);ctx.stroke();}
   ctx.strokeStyle='#8a6030';ctx.lineWidth=.8;
-  for(let i=0;i<SIZE;i++){
-    const[x1,y1]=getXY(i,0),[x2,y2]=getXY(i,SIZE-1);
+  for(let i=0;i<BSIZE;i++){
+    const[x1,y1]=xy(i,0),[x2,y2]=xy(i,BSIZE-1);
     ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
-    const[bx1,by1]=getXY(0,i),[bx2,by2]=getXY(SIZE-1,i);
-    ctx.beginPath();ctx.moveTo(bx1,by1);ctx.lineTo(bx2,by2);ctx.stroke();
+    const[bx,by]=xy(0,i),[bx2,by2]=xy(BSIZE-1,i);
+    ctx.beginPath();ctx.moveTo(bx,by);ctx.lineTo(bx2,by2);ctx.stroke();
   }
-  ctx.strokeStyle='#7a5820';ctx.lineWidth=2;
-  ctx.strokeRect(PADDING,PADDING,(SIZE-1)*STEP,(SIZE-1)*STEP);
+  ctx.strokeStyle='#7a5820';ctx.lineWidth=2;ctx.strokeRect(PADDING,PADDING,(BSIZE-1)*STEP,(BSIZE-1)*STEP);
+  // Stars
+  const mid=Math.floor(BSIZE/2), stars=BSIZE===19?[[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,15]]:BSIZE===13?[[3,3],[3,9],[6,6],[9,3],[9,9]]:[[3,3],[3,11],[7,7],[11,3],[11,11]];
   ctx.fillStyle='#7a5820';
-  [[3,3],[3,11],[7,7],[11,3],[11,11]].forEach(([c,r])=>{
-    const[x,y]=getXY(c,r);ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);ctx.fill();
-  });
-  ctx.fillStyle='rgba(100,68,20,0.6)';ctx.font='9px Noto Serif TC';ctx.textAlign='center';ctx.textBaseline='middle';
-  for(let i=0;i<SIZE;i++){
-    const[x]=getXY(i,0);ctx.fillText(COLS[i],x,PADDING-14);ctx.fillText(COLS[i],x,CANVAS_SIZE-PADDING+14);
-    const[,y]=getXY(0,i);ctx.textAlign='right';ctx.fillText(SIZE-i,PADDING-10,y);ctx.textAlign='left';ctx.fillText(SIZE-i,CANVAS_SIZE-PADDING+10,y);ctx.textAlign='center';
+  stars.forEach(([c,r])=>{const[x,y]=xy(c,r);ctx.beginPath();ctx.arc(x,y,3.5,0,Math.PI*2);ctx.fill();});
+  // Coords
+  ctx.fillStyle='rgba(100,68,20,0.6)';ctx.font=`${Math.max(8,10-Math.floor((BSIZE-15)/2))}px Noto Serif TC`;
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  for(let i=0;i<BSIZE;i++){
+    const[x]=xy(i,0);ctx.fillText(COLS[i],x,PADDING-13);ctx.fillText(COLS[i],x,CSIZE-PADDING+13);
+    const[,y]=xy(0,i);ctx.textAlign='right';ctx.fillText(BSIZE-i,PADDING-9,y);ctx.textAlign='left';ctx.fillText(BSIZE-i,CSIZE-PADDING+9,y);ctx.textAlign='center';
   }
 }
 
 function drawStone(col,row,player,ghost=false){
-  const[x,y]=getXY(col,row),r=STEP*.44;
-  ctx.save();
-  if(ghost)ctx.globalAlpha=.35;
+  const[x,y]=xy(col,row),r=STEP*.44;
+  ctx.save();if(ghost)ctx.globalAlpha=.35;
   if(player===1){
     const g=ctx.createRadialGradient(x-r*.3,y-r*.3,r*.05,x,y,r);
     g.addColorStop(0,'#888');g.addColorStop(.3,'#333');g.addColorStop(1,'#0a0a0a');
@@ -361,7 +514,7 @@ function drawStone(col,row,player,ghost=false){
     ctx.fillStyle='rgba(255,255,255,0.18)';ctx.beginPath();ctx.ellipse(x-r*.25,y-r*.28,r*.28,r*.18,-Math.PI/5,0,Math.PI*2);ctx.fill();
   }else{
     const g=ctx.createRadialGradient(x-r*.3,y-r*.3,r*.05,x,y,r);
-    g.addColorStop(0,'#ffffff');g.addColorStop(.5,'#e8e0d0');g.addColorStop(1,'#c0b89a');
+    g.addColorStop(0,'#fff');g.addColorStop(.5,'#e8e0d0');g.addColorStop(1,'#c0b89a');
     ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();
     ctx.strokeStyle='rgba(150,130,90,0.4)';ctx.lineWidth=.5;ctx.stroke();
     ctx.fillStyle='rgba(255,255,255,0.55)';ctx.beginPath();ctx.ellipse(x-r*.25,y-r*.28,r*.26,r*.16,-Math.PI/5,0,Math.PI*2);ctx.fill();
@@ -370,22 +523,21 @@ function drawStone(col,row,player,ghost=false){
 }
 
 function drawLastMark(col,row,player){
-  const[x,y]=getXY(col,row);
+  const[x,y]=xy(col,row);
   ctx.strokeStyle=player===1?'rgba(255,220,80,0.9)':'rgba(180,80,40,0.8)';
   ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.stroke();
 }
 
 function drawWinLine(line){
   if(!line||line.length<2)return;
-  const[x1,y1]=getXY(line[0][1],line[0][0]),[x2,y2]=getXY(line[line.length-1][1],line[line.length-1][0]);
-  ctx.strokeStyle='rgba(255,200,50,0.85)';ctx.lineWidth=4;ctx.lineCap='round';
-  ctx.shadowColor='rgba(255,200,50,0.5)';ctx.shadowBlur=8;
+  const[x1,y1]=xy(line[0][1],line[0][0]),[x2,y2]=xy(line[line.length-1][1],line[line.length-1][0]);
+  ctx.strokeStyle='rgba(255,200,50,0.9)';ctx.lineWidth=4;ctx.lineCap='round';
+  ctx.shadowColor='rgba(255,200,50,0.6)';ctx.shadowBlur=10;
   ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();ctx.shadowBlur=0;
 }
 
-// Responsive
 function resizeCanvas(){
-  const s=Math.min(window.innerWidth-480,540,window.innerHeight-160);
+  const s=Math.min(window.innerWidth-440,CSIZE,window.innerHeight-160);
   canvas.style.width=s+'px';canvas.style.height=s+'px';
 }
 window.addEventListener('resize',resizeCanvas);
@@ -394,185 +546,244 @@ drawBoard();
 </script>
 
 <style>
-:root{
-  --board-dark:#9c7a3a;--bg:#1a1410;--panel:#221c14;
-  --gold:#d4a94a;--gold-l:#f0c96a;--text:#f0e6cc;--muted:#a08860;
-}
+:root{--board-dark:#9c7a3a;--bg:#1a1410;--panel:#221c14;--gold:#d4a94a;--gold-l:#f0c96a;--text:#f0e6cc;--muted:#a08860;}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:'Noto Serif TC',serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background-image:radial-gradient(ellipse at 20% 20%,rgba(180,140,60,.08) 0%,transparent 60%),radial-gradient(ellipse at 80% 80%,rgba(120,60,20,.1) 0%,transparent 60%)}
-h1{font-family:'Cinzel',serif;font-size:clamp(1.4rem,3vw,2rem);color:var(--gold);text-shadow:0 0 30px rgba(212,169,74,.4);letter-spacing:.3em;text-align:center;margin-bottom:.2rem}
-.sub{font-size:.75rem;color:var(--muted);letter-spacing:.2em;text-align:center;margin-bottom:1.2rem}
+body{background:var(--bg);color:var(--text);font-family:'Noto Serif TC',serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background-image:radial-gradient(ellipse at 20% 20%,rgba(180,140,60,.08) 0%,transparent 60%),radial-gradient(ellipse at 80% 80%,rgba(120,60,20,.1) 0%,transparent 60%);padding:1rem 0}
+h1{font-family:'Cinzel',serif;font-size:clamp(1.3rem,3vw,2rem);color:var(--gold);text-shadow:0 0 30px rgba(212,169,74,.4);letter-spacing:.3em;text-align:center;margin-bottom:.2rem}
+.sub{font-size:.72rem;color:var(--muted);letter-spacing:.2em;text-align:center;margin-bottom:1rem}
 
-/* ── LOBBY ── */
-#lobby{background:var(--panel);border:1px solid rgba(212,169,74,.2);border-radius:16px;padding:2rem;width:380px;max-width:95vw}
-.lobby-title{font-family:'Cinzel',serif;font-size:1rem;color:var(--gold);letter-spacing:.2em;margin-bottom:1rem;text-align:center}
-input[type=text]{width:100%;padding:.6rem .9rem;background:rgba(255,255,255,.05);border:1px solid rgba(212,169,74,.25);border-radius:6px;color:var(--text);font-family:'Noto Serif TC',serif;font-size:.85rem;outline:none;margin-bottom:.75rem}
-input[type=text]:focus{border-color:var(--gold)}
-input[type=text]::placeholder{color:var(--muted)}
-.btn-row{display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.75rem}
-.btn{padding:.6rem;background:transparent;border:1px solid rgba(212,169,74,.35);color:var(--gold);border-radius:6px;cursor:pointer;font-family:'Noto Serif TC',serif;font-size:.8rem;letter-spacing:.1em;transition:all .2s}
+/* LOBBY */
+#lobby{background:var(--panel);border:1px solid rgba(212,169,74,.2);border-radius:16px;padding:1.6rem;width:420px;max-width:96vw}
+.lobby-title{font-family:'Cinzel',serif;font-size:.95rem;color:var(--gold);letter-spacing:.2em;margin-bottom:1rem;text-align:center}
+.field-label{font-size:.65rem;color:var(--muted);letter-spacing:.12em;text-transform:uppercase;margin-bottom:.3rem}
+input[type=text],select{width:100%;padding:.55rem .85rem;background:rgba(255,255,255,.05);border:1px solid rgba(212,169,74,.25);border-radius:6px;color:var(--text);font-family:'Noto Serif TC',serif;font-size:.82rem;outline:none;margin-bottom:.7rem;appearance:none}
+input[type=text]:focus,select:focus{border-color:var(--gold)}
+input::placeholder{color:var(--muted)}
+select option{background:#221c14;color:var(--text)}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:.5rem .8rem;margin-bottom:.8rem}
+.settings-grid .field{display:flex;flex-direction:column}
+.settings-grid select{margin-bottom:0}
+.checkbox-row{display:flex;align-items:center;gap:.5rem;padding:.45rem .6rem;background:rgba(255,255,255,.03);border:1px solid rgba(212,169,74,.15);border-radius:6px;cursor:pointer;margin-bottom:.7rem}
+.checkbox-row input[type=checkbox]{width:16px;height:16px;accent-color:var(--gold);margin:0;flex-shrink:0}
+.checkbox-row label{font-size:.78rem;color:var(--text);cursor:pointer;line-height:1.4}
+.checkbox-row label small{display:block;font-size:.65rem;color:var(--muted)}
+.btn-row{display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.6rem}
+.btn{padding:.58rem;background:transparent;border:1px solid rgba(212,169,74,.35);color:var(--gold);border-radius:6px;cursor:pointer;font-family:'Noto Serif TC',serif;font-size:.78rem;letter-spacing:.08em;transition:all .2s}
 .btn:hover{background:rgba(212,169,74,.12);border-color:var(--gold)}
 .btn-full{grid-column:1/-1}
-.lobby-msg{font-size:.8rem;text-align:center;min-height:1.2em;margin-bottom:.5rem}
-.divider{height:1px;background:rgba(212,169,74,.12);margin:.75rem 0}
-#invite-line{display:none;align-items:center;gap:.5rem;margin-bottom:.5rem}
-#room-code-display{font-family:'Cinzel',serif;font-size:1.3rem;color:var(--gold);letter-spacing:.3em;flex:1;text-align:center}
-#waiting-msg{display:none;text-align:center;font-size:.75rem;color:var(--muted);letter-spacing:.1em;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
+.lobby-msg{font-size:.78rem;text-align:center;min-height:1.1em;margin-bottom:.4rem}
+.dv{height:1px;background:rgba(212,169,74,.12);margin:.7rem 0}
+#invite-line{display:none;align-items:center;gap:.5rem;margin-bottom:.4rem}
+#room-code-display{font-family:'Cinzel',serif;font-size:1.3rem;color:var(--gold);letter-spacing:.35em;flex:1;text-align:center}
+#waiting-msg{display:none;text-align:center;font-size:.72rem;color:var(--muted);letter-spacing:.1em;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
 
-/* ── GAME ── */
-#game{display:none;align-items:flex-start;gap:1.2rem;flex-wrap:wrap;justify-content:center}
-.side{background:var(--panel);border:1px solid rgba(212,169,74,.2);border-radius:12px;padding:1.1rem;width:168px;display:flex;flex-direction:column;gap:.8rem}
-.sec-label{font-size:.62rem;color:var(--muted);letter-spacing:.15em;text-transform:uppercase}
-.player-card{background:rgba(255,255,255,.03);border-radius:8px;padding:.8rem;border:1.5px solid transparent;transition:border-color .3s,background .3s;position:relative;overflow:hidden}
+/* GAME */
+#game{display:none;align-items:flex-start;gap:1.1rem;flex-wrap:wrap;justify-content:center}
+.side{background:var(--panel);border:1px solid rgba(212,169,74,.2);border-radius:12px;padding:1rem;width:162px;display:flex;flex-direction:column;gap:.75rem}
+.sec-label{font-size:.6rem;color:var(--muted);letter-spacing:.15em;text-transform:uppercase}
+.player-card{background:rgba(255,255,255,.03);border-radius:8px;padding:.75rem;border:1.5px solid transparent;transition:border-color .3s,background .3s;position:relative;overflow:hidden}
 .player-card.active{border-color:var(--gold);background:rgba(212,169,74,.06)}
-.player-card.active::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--gold),transparent);animation:shimmer 2s infinite}
-@keyframes shimmer{0%,100%{opacity:.4}50%{opacity:1}}
-.stone-dot{width:28px;height:28px;border-radius:50%;margin-bottom:.4rem}
+.player-card.active::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--gold),transparent);animation:sh 2s infinite}
+@keyframes sh{0%,100%{opacity:.4}50%{opacity:1}}
+.stone-dot{width:26px;height:26px;border-radius:50%;margin-bottom:.35rem}
 .stone-dot.black{background:radial-gradient(circle at 35% 35%,#555,#111);box-shadow:inset -2px -2px 5px rgba(0,0,0,.8)}
 .stone-dot.white{background:radial-gradient(circle at 35% 35%,#fff,#d8cfc0);box-shadow:inset -2px -2px 5px rgba(0,0,0,.2)}
-.pname{font-size:.82rem;color:var(--text);font-weight:700;letter-spacing:.05em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.plabel{font-size:.65rem;color:var(--muted);margin-top:1px}
-.turn-box{text-align:center;padding:.55rem;background:rgba(212,169,74,.08);border-radius:6px;border:1px solid rgba(212,169,74,.15)}
-.turn-text{font-size:.7rem;color:var(--muted)}
-.turn-name{font-size:.82rem;color:var(--gold);font-weight:700;margin-top:2px;min-height:1.1em}
-.my-badge{font-size:.68rem;color:rgba(212,169,74,.7);text-align:center;letter-spacing:.05em;padding:.3rem;border:1px dashed rgba(212,169,74,.2);border-radius:4px}
-.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.stat-cell{text-align:center;padding:.45rem;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid rgba(212,169,74,.1)}
-.stat-num{font-family:'Cinzel',serif;font-size:1.2rem;color:var(--gold)}
-.stat-lbl{font-size:.6rem;color:var(--muted);margin-top:1px}
+.pname{font-size:.8rem;color:var(--text);font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.plabel{font-size:.62rem;color:var(--muted);margin-top:1px}
+.score-row{display:flex;justify-content:space-between;align-items:baseline;margin-top:.3rem}
+.score-num{font-family:'Cinzel',serif;font-size:1.1rem;color:var(--gold)}
+.score-lbl{font-size:.6rem;color:var(--muted)}
+.my-badge{font-size:.65rem;color:rgba(212,169,74,.7);text-align:center;padding:.28rem;border:1px dashed rgba(212,169,74,.2);border-radius:4px}
+.score-target{font-size:.65rem;color:var(--muted);text-align:center;letter-spacing:.08em}
+.turn-box{text-align:center;padding:.5rem;background:rgba(212,169,74,.08);border-radius:6px;border:1px solid rgba(212,169,74,.15)}
+.turn-lbl{font-size:.65rem;color:var(--muted)}
+.turn-name{font-size:.78rem;color:var(--gold);font-weight:700;margin-top:2px;min-height:1em}
+#timer-display{display:none;text-align:center;font-family:'Cinzel',serif;font-size:.82rem;color:var(--gold);padding:.3rem;border:1px solid rgba(212,169,74,.2);border-radius:5px;letter-spacing:.08em}
+.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.stat-cell{text-align:center;padding:.4rem;background:rgba(255,255,255,.03);border-radius:5px;border:1px solid rgba(212,169,74,.1)}
+.stat-num{font-family:'Cinzel',serif;font-size:1.1rem;color:var(--gold)}
+.stat-lbl{font-size:.58rem;color:var(--muted);margin-top:1px}
 .dv{height:1px;background:rgba(212,169,74,.12)}
-.btn-sm{width:100%;padding:.55rem;background:transparent;border:1px solid rgba(212,169,74,.35);color:var(--gold);border-radius:6px;cursor:pointer;font-family:'Noto Serif TC',serif;font-size:.75rem;letter-spacing:.1em;transition:all .2s}
-.btn-sm:hover{background:rgba(212,169,74,.12)}
-.btn-sm.red{border-color:rgba(192,57,43,.4);color:#e74c3c}
-.btn-sm.red:hover{background:rgba(192,57,43,.1)}
-
-/* ── CHAT ── */
-.chat-wrap{flex:1;display:flex;flex-direction:column;gap:4px}
-#chat-messages{flex:1;max-height:140px;overflow-y:auto;font-size:.68rem;line-height:1.7;scrollbar-width:thin;scrollbar-color:rgba(212,169,74,.3) transparent}
-.chat-empty{color:rgba(160,136,96,.45);font-size:.68rem}
+.btn-sm{width:100%;padding:.5rem;background:transparent;border:1px solid rgba(212,169,74,.3);color:var(--gold);border-radius:6px;cursor:pointer;font-family:'Noto Serif TC',serif;font-size:.72rem;letter-spacing:.08em;transition:all .2s}
+.btn-sm:hover{background:rgba(212,169,74,.1)}
+.btn-sm.red{border-color:rgba(192,57,43,.35);color:#e74c3c}
+.btn-sm.red:hover{background:rgba(192,57,43,.08)}
+.rules-txt{font-size:.63rem;color:var(--muted);line-height:1.9;letter-spacing:.03em}
+/* Chat */
+.chat-wrap{display:flex;flex-direction:column;gap:4px}
+#chat-messages{max-height:130px;overflow-y:auto;font-size:.66rem;line-height:1.75;scrollbar-width:thin;scrollbar-color:rgba(212,169,74,.25) transparent}
+.chat-empty{color:rgba(160,136,96,.4);font-size:.66rem}
 .chat-msg{margin-bottom:2px}
-.chat-who{color:var(--muted);margin-right:4px;font-size:.65rem}
+.chat-who{color:var(--muted);margin-right:3px;font-size:.62rem}
 .chat-text{color:var(--text)}
 .chat-msg.mine .chat-who{color:var(--gold)}
 .chat-row{display:flex;gap:4px;margin-top:4px}
-.chat-row input{flex:1;padding:.35rem .6rem;background:rgba(255,255,255,.05);border:1px solid rgba(212,169,74,.2);border-radius:4px;color:var(--text);font-family:'Noto Serif TC',serif;font-size:.72rem;outline:none}
-.chat-row input:focus{border-color:rgba(212,169,74,.5)}
-.chat-row button{padding:.35rem .6rem;background:rgba(212,169,74,.15);border:1px solid rgba(212,169,74,.3);color:var(--gold);border-radius:4px;cursor:pointer;font-size:.72rem}
-
-/* ── BOARD WRAPPER ── */
+.chat-row input{flex:1;padding:.32rem .55rem;background:rgba(255,255,255,.05);border:1px solid rgba(212,169,74,.2);border-radius:4px;color:var(--text);font-family:'Noto Serif TC',serif;font-size:.7rem;outline:none;min-width:0}
+.chat-row input:focus{border-color:rgba(212,169,74,.45)}
+.chat-row button{padding:.32rem .55rem;background:rgba(212,169,74,.13);border:1px solid rgba(212,169,74,.28);color:var(--gold);border-radius:4px;cursor:pointer;font-size:.7rem;white-space:nowrap}
+/* Board */
 .board-wrap{position:relative}
 canvas#board{display:block;border-radius:4px;cursor:crosshair;box-shadow:0 0 0 6px var(--board-dark),0 0 0 10px rgba(212,169,74,.15),0 20px 60px rgba(0,0,0,.7)}
-
-/* ── WIN OVERLAY ── */
+/* Forbidden flash */
+#forbidden-flash{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(180,30,30,.9);color:#fff;padding:.5rem 1.2rem;border-radius:8px;font-size:.85rem;letter-spacing:.1em;opacity:0;transition:opacity .4s;pointer-events:none;white-space:nowrap}
+/* Win overlay */
 .win-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.65);border-radius:4px;opacity:0;pointer-events:none;transition:opacity .4s;backdrop-filter:blur(2px)}
 .win-overlay.visible{opacity:1;pointer-events:all}
-.win-box{background:var(--panel);border:1px solid var(--gold);border-radius:16px;padding:1.8rem 2.2rem;text-align:center;box-shadow:0 0 60px rgba(212,169,74,.25);animation:popIn .4s cubic-bezier(.34,1.56,.64,1) forwards}
-@keyframes popIn{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}
-.win-emoji{font-size:2.2rem;margin-bottom:.4rem}
-.win-title{font-family:'Cinzel',serif;font-size:1.4rem;color:var(--gold);letter-spacing:.2em;margin-bottom:.2rem}
-.win-sub{font-size:.8rem;color:var(--muted);margin-bottom:1rem}
-.win-btn{padding:.6rem 1.8rem;background:var(--gold);color:#1a1410;border:none;border-radius:6px;cursor:pointer;font-family:'Noto Serif TC',serif;font-size:.82rem;font-weight:700;letter-spacing:.15em;transition:all .2s;margin:.3rem}
-.win-btn:hover{background:var(--gold-l);transform:scale(1.03)}
-.win-btn.sec{background:transparent;border:1px solid rgba(212,169,74,.4);color:var(--gold)}
-footer{margin-top:.8rem;font-size:.65rem;color:var(--muted);letter-spacing:.1em;text-align:center}
+.win-box{background:var(--panel);border:1px solid var(--gold);border-radius:16px;padding:1.6rem 2rem;text-align:center;box-shadow:0 0 60px rgba(212,169,74,.2);animation:popIn .4s cubic-bezier(.34,1.56,.64,1) forwards}
+@keyframes popIn{from{transform:scale(.75);opacity:0}to{transform:scale(1);opacity:1}}
+.win-emoji{font-size:2rem;margin-bottom:.35rem}
+.win-title{font-family:'Cinzel',serif;font-size:1.3rem;color:var(--gold);letter-spacing:.2em;margin-bottom:.2rem}
+.win-sub{font-size:.78rem;color:var(--muted);margin-bottom:.9rem;white-space:pre-line}
+.win-btn{padding:.55rem 1.6rem;background:var(--gold);color:#1a1410;border:none;border-radius:6px;cursor:pointer;font-family:'Noto Serif TC',serif;font-size:.8rem;font-weight:700;letter-spacing:.12em;transition:all .2s;margin:.25rem;display:block;width:100%}
+.win-btn:hover{background:var(--gold-l)}
+.win-btn.sec{background:transparent;border:1px solid rgba(212,169,74,.35);color:var(--gold)}
+footer{margin-top:.7rem;font-size:.62rem;color:var(--muted);letter-spacing:.1em;text-align:center}
 </style>
 </head>
 <body>
-
 <h1>五 子 棋</h1>
 <p class="sub">GOMOKU ONLINE · FIREBASE</p>
 
-<!-- ── LOBBY ── -->
+<!-- LOBBY -->
 <div id="lobby">
-  <div class="lobby-title">加入或建立房間</div>
-  <input type="text" id="nick-input" placeholder="輸入你的暱稱" maxlength="12">
+  <div class="lobby-title">建立 / 加入房間</div>
 
-  <div class="divider"></div>
-  <p class="sec-label" style="margin-bottom:.5rem">建立新房間</p>
-  <button class="btn btn-full" onclick="createRoom()">＋ 建立房間（黑方先手）</button>
+  <div class="field-label">你的暱稱</div>
+  <input type="text" id="nick-input" placeholder="輸入暱稱（最多12字）" maxlength="12">
+
+  <div class="dv"></div>
+  <div class="field-label" style="margin-bottom:.6rem">房間設定（建立時有效）</div>
+
+  <div class="settings-grid">
+    <div class="field">
+      <div class="field-label">棋盤大小</div>
+      <select id="opt-size">
+        <option value="13">13×13（小）</option>
+        <option value="15" selected>15×15（標準）</option>
+        <option value="19">19×19（大）</option>
+      </select>
+    </div>
+    <div class="field">
+      <div class="field-label">勝利局數</div>
+      <select id="opt-wins">
+        <option value="1">單局制</option>
+        <option value="2">三局兩勝</option>
+        <option value="3" selected>五局三勝</option>
+        <option value="4">七局四勝</option>
+      </select>
+    </div>
+    <div class="field">
+      <div class="field-label">每步限時</div>
+      <select id="opt-time">
+        <option value="0" selected>無限制</option>
+        <option value="15">15 秒</option>
+        <option value="30">30 秒</option>
+        <option value="60">60 秒</option>
+        <option value="120">2 分鐘</option>
+      </select>
+    </div>
+    <div class="field">
+      <div class="field-label">先手</div>
+      <select id="opt-first">
+        <option value="black" selected>我執黑（先）</option>
+        <option value="white">我執白（後）</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="checkbox-row">
+    <input type="checkbox" id="opt-forbidden">
+    <label for="opt-forbidden">啟用黑方禁手
+      <small>三三禁、四四禁（僅限黑方）</small>
+    </label>
+  </div>
+
+  <div class="btn-row">
+    <button class="btn btn-full" onclick="createRoom()">＋ 建立房間</button>
+  </div>
 
   <div id="invite-line">
-    <span style="font-size:.7rem;color:var(--muted)">房間號</span>
+    <span style="font-size:.68rem;color:var(--muted)">房間號</span>
     <span id="room-code-display"></span>
-    <button class="btn" style="padding:.3rem .7rem;font-size:.72rem" onclick="copyRoomCode()">複製</button>
+    <button class="btn" style="padding:.28rem .6rem;font-size:.7rem" onclick="copyRoomCode()">複製</button>
   </div>
   <div id="waiting-msg">等待對手加入中…</div>
 
-  <div class="divider"></div>
-  <p class="sec-label" style="margin-bottom:.5rem">加入現有房間</p>
+  <div class="dv"></div>
+  <div class="field-label">加入現有房間</div>
   <input type="text" id="room-input" placeholder="輸入6位房間號" maxlength="6" style="text-transform:uppercase;letter-spacing:.2em">
-  <button class="btn btn-full" onclick="joinRoomById()">→ 加入房間（白方後手）</button>
+  <button class="btn btn-full" onclick="joinRoomById()">→ 加入房間</button>
 
   <div id="lobby-msg" class="lobby-msg"></div>
 </div>
 
-<!-- ── GAME ── -->
+<!-- GAME -->
 <div id="game">
 
-  <!-- Left -->
+  <!-- Left panel -->
   <div class="side">
     <div class="sec-label">玩家</div>
     <div class="player-card active" id="card-black">
       <div class="stone-dot black"></div>
       <div class="pname" id="name-black">黑方</div>
       <div class="plabel">先手 · BLACK</div>
+      <div class="score-row">
+        <span class="score-lbl">勝</span>
+        <span class="score-num" id="score-black">0</span>
+      </div>
     </div>
     <div class="player-card" id="card-white">
       <div class="stone-dot white"></div>
-      <div class="pname" id="name-white">等待加入…</div>
+      <div class="pname" id="name-white">白方</div>
       <div class="plabel">後手 · WHITE</div>
+      <div class="score-row">
+        <span class="score-lbl">勝</span>
+        <span class="score-num" id="score-white">0</span>
+      </div>
     </div>
     <div class="my-badge" id="my-color-badge">—</div>
+    <div class="score-target" id="score-target">目標 3 勝</div>
     <div class="dv"></div>
     <div class="turn-box">
-      <div class="turn-text">目前</div>
+      <div class="turn-lbl">目前</div>
       <div class="turn-name" id="turn-display">等待對手</div>
     </div>
+    <div id="timer-display">—</div>
     <div class="stat-grid">
-      <div class="stat-cell">
-        <div class="stat-num" id="stat-moves">0</div>
-        <div class="stat-lbl">手數</div>
-      </div>
-      <div class="stat-cell">
-        <div class="stat-num" id="stat-room">—</div>
-        <div class="stat-lbl">房間</div>
-      </div>
+      <div class="stat-cell"><div class="stat-num" id="stat-moves">0</div><div class="stat-lbl">手數</div></div>
+      <div class="stat-cell"><div class="stat-num" id="stat-room">—</div><div class="stat-lbl">房間</div></div>
     </div>
   </div>
 
   <!-- Board -->
   <div class="board-wrap">
     <canvas id="board" width="540" height="540"></canvas>
+    <div id="forbidden-flash"></div>
     <div class="win-overlay" id="win-overlay">
       <div class="win-box">
         <div class="win-emoji" id="win-emoji">🎉</div>
         <div class="win-title" id="win-title">勝利！</div>
         <div class="win-sub" id="win-sub"></div>
-        <button class="win-btn" onclick="resetGame()">再來一局</button>
+        <button class="win-btn" id="win-reset-btn" onclick="resetGame()">再來一局</button>
         <button class="win-btn sec" onclick="leaveRoom()">離開房間</button>
       </div>
     </div>
   </div>
 
-  <!-- Right -->
+  <!-- Right panel -->
   <div class="side">
     <div class="sec-label">聊天室</div>
     <div class="chat-wrap">
       <div id="chat-messages"><div class="chat-empty">說點什麼吧…</div></div>
       <div class="chat-row">
         <input type="text" id="chat-input" placeholder="說點什麼…" maxlength="60">
-        <button onclick="sendChat()">送出</button>
+        <button onclick="sendChat()">送</button>
       </div>
     </div>
     <div class="dv"></div>
-    <div class="sec-label">規則</div>
-    <div style="font-size:.65rem;color:var(--muted);line-height:1.9;letter-spacing:.04em">
-      • 15×15 標準棋盤<br>
-      • 黑方先行<br>
-      • 五子連線獲勝<br>
-      • 橫縱斜均計，長連亦算
-    </div>
+    <div class="sec-label">本局規則</div>
+    <div class="rules-txt" id="rules-display">等待開始…</div>
     <div class="dv"></div>
     <button class="btn-sm red" onclick="leaveRoom()">✕ 離開房間</button>
   </div>
@@ -580,16 +791,5 @@ footer{margin-top:.8rem;font-size:.65rem;color:var(--muted);letter-spacing:.1em;
 </div>
 
 <footer>五子棋 Online · Firebase Realtime Database</footer>
-
-<script>
-// Show room number in stat once in game
-const _orig = window.joinRoom;
-document.addEventListener('DOMContentLoaded', ()=>{
-  const statRoom = document.getElementById('stat-room');
-  const orig = setInterval(()=>{
-    if(window.roomId){ statRoom.textContent = window.roomId; clearInterval(orig); }
-  }, 300);
-});
-</script>
 </body>
 </html>
