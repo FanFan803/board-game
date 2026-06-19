@@ -1638,8 +1638,8 @@ function drawC4Board(){
   drawVignette(C4_W,C4_H);
 }
 
-function drawC4Piece(col,row,player,ghost=false){
-  const [x,y]=c4XY(col,row), r=Math.min(C4_STEPX,C4_STEPY)*0.38;
+function drawC4PieceXY(x,y,player,ghost=false){
+  const r=Math.min(C4_STEPX,C4_STEPY)*0.38;
   ctx.save(); if(ghost) ctx.globalAlpha=.4;
   if(!ghost){ ctx.shadowColor='rgba(0,0,0,0.5)'; ctx.shadowBlur=7; ctx.shadowOffsetY=3; }
   ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);
@@ -1648,6 +1648,17 @@ function drawC4Piece(col,row,player,ghost=false){
   else { g.addColorStop(0,'#ffe16b');g.addColorStop(1,'#d4a017'); }
   ctx.fillStyle=g; ctx.fill();
   ctx.restore();
+}
+function drawC4Piece(col,row,player,ghost=false){
+  const [x,y]=c4XY(col,row);
+  drawC4PieceXY(x,y,player,ghost);
+}
+function easeOutBounce(t){
+  const n1=7.5625, d1=2.75;
+  if (t<1/d1) return n1*t*t;
+  if (t<2/d1) { t-=1.5/d1; return n1*t*t+0.75; }
+  if (t<2.5/d1) { t-=2.25/d1; return n1*t*t+0.9375; }
+  t-=2.625/d1; return n1*t*t+0.984375;
 }
 
 function drawC4LastMark(col,row){
@@ -1669,11 +1680,19 @@ function drawC4WinLine(line){
 
 function renderConnect4(){
   drawC4Board();
+  const age=moveAge();
+  const dropping = lastMove && age<1;
   for(let r=0;r<C4_ROWS;r++) for(let c=0;c<C4_COLS;c++){
     const v=localBoard[r*C4_COLS+c];
-    if(v) drawC4Piece(c,r,v);
+    if(v && !(dropping && r===lastMove.row && c===lastMove.col)) drawC4Piece(c,r,v);
   }
-  if(lastMove) drawC4LastMark(lastMove.col,lastMove.row);
+  if(dropping){
+    const [tx,ty]=c4XY(lastMove.col,lastMove.row);
+    const startY = C4_PAD - C4_STEPY*0.6;
+    const y = startY + (ty-startY)*easeOutBounce(age);
+    drawC4PieceXY(tx,y,lastMove.player);
+  }
+  if(lastMove && !dropping) drawC4LastMark(lastMove.col,lastMove.row);
   if(winLine?.length) drawC4WinLine(winLine);
 }
 
